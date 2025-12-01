@@ -86,26 +86,38 @@ def load_and_prepare_dataset(
 
 
 class ProbeModel(nn.Module):
-    def __init__(self, lm: AutoModelForCausalLM):
+    def __init__(self, lm: AutoModelForCausalLM, max_length: int):
         super().__init__()
         self.lm = lm
+        self.max_length = max_length
         for param in self.lm.parameters():
             param.requires_grad = False
-        hidden_size = self.lm.config.hidden_size
-        self.classifier = nn.Linear(hidden_size, NUM_CLASSES)
+        num_heads = self.lm.config.num_attention_heads
+        self.classifier = nn.Linear(num_heads * max_length, NUM_CLASSES)
 
     def forward(self, input_ids, attention_mask, labels=None):
         outputs = self.lm(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            output_hidden_states=True,
+            output_attentions=True,
             return_dict=True,
         )
-        hidden = outputs.hidden_states[-1]  # (batch, seq, hidden)
-        lengths = attention_mask.sum(dim=1) - 1
-        batch_indices = torch.arange(hidden.size(0), device=hidden.device)
-        last_tokens = hidden[batch_indices, lengths]
-        logits = self.classifier(last_tokens)
+        if outputs.attentions is None:
+            raise RuntimeError("Model did not return attentions. Ensure attention implementation is set to 'eager'.")
+        attn = outputs.attentions[-1]  # (batch, heads, seq, seq)
+        lengths = attention_mask.sum(dim=1) - 1  # last non-pad token index
+        batch_indices = torch.arange(attn.size(0), device=attn.device)
+        # Slice attention for the last token: (batch, heads, seq)
+        last_token_attn = attn[batch_indices, :, lengths]
+        # Flatten per-head attention over all positions into a single feature vector.
+        # Requires fixed seq length; we enforce padding to max_length below.
+        if last_token_attn.size(-1) != self.max_length:
+            raise RuntimeError(
+                f"Expected sequence length {self.max_length}, got {last_token_attn.size(-1)}. "
+                "Ensure padding='max_length' matches --max-length."
+            )
+        features = last_token_attn.reshape(last_token_attn.size(0), -1)  # (batch, heads*seq)
+        logits = self.classifier(features)
         loss = None
         if labels is not None:
             loss = nn.functional.cross_entropy(logits, labels)
@@ -140,7 +152,9 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_id)
     lm = AutoModelForCausalLM.from_pretrained(args.model_id)
-    probe_model = ProbeModel(lm).to(device)
+    if hasattr(lm, "set_attn_implementation"):
+        lm.set_attn_implementation("eager")  # needed to get attentions
+    probe_model = ProbeModel(lm, max_length=args.max_length).to(device)
 
     train_ds, val_ds = load_and_prepare_dataset(
         data_path=args.data_path,
@@ -151,7 +165,7 @@ def main():
         limit=args.limit,
     )
 
-    collator = DataCollatorWithPadding(tokenizer)
+    collator = DataCollatorWithPadding(tokenizer, padding="max_length", max_length=args.max_length)
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
