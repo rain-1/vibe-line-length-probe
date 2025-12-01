@@ -42,6 +42,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-split", type=float, default=0.1)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--log-every", type=int, default=50, help="Log train loss every N steps.")
+    parser.add_argument(
+        "--eval-every",
+        type=int,
+        default=0,
+        help="Run validation every N training steps (0 disables mid-epoch eval).",
+    )
     parser.add_argument("--limit", type=int, default=None, help="Optional cap on samples for quick experiments.")
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging.")
     parser.add_argument("--wandb-project", type=str, default="line-length-probes")
@@ -221,6 +227,20 @@ def main():
                 pbar.set_postfix({"loss": f"{loss.item():.4f}"})
                 if run:
                     run.log(step_log)
+
+            if args.eval_every and global_step % args.eval_every == 0:
+                probe_model.eval()
+                val_metrics = evaluate(probe_model, val_loader, device)
+                probe_model.train()
+                val_log = {
+                    "step": global_step,
+                    "epoch": epoch,
+                    "val_loss": val_metrics["loss"],
+                    "val_accuracy": val_metrics["accuracy"],
+                }
+                print(f"[step {global_step}] mid-epoch val: {val_log}")
+                if run:
+                    run.log(val_log)
 
         train_loss = running_loss / len(train_ds)
         val_metrics = evaluate(probe_model, val_loader, device)
